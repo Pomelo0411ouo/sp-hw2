@@ -2,11 +2,33 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <string.h>
+#include <unistd.h>
+
+typedef struct {
+  pid_t pid;
+  struct child *nxt;
+  int child_ptoc;
+  int child_ctop;
+} Child;
+
+char buf[1024];
+size_t buf_size = 1024;
+
+struct Child *child_head = NULL;
+struct Child *child_tail = NULL;
+
 
 int main(int argc, char *argv[]) {
-  if (argc > 1) {
-    fprintf(stderr, "Usage: ./sp\n");
-    return 1;
+  int cmd_fd, reply_fd, ptoc_fd, ctop_fd;
+  bool is_main = false;
+  if (argc == 1) {
+    is_main = true;
   }
 
   // TODO: Determine whether the current process is SP main.
@@ -14,24 +36,106 @@ int main(int argc, char *argv[]) {
   //       SP main and SP child processes. Therefore, you will set some
   //       variables here.
 
+  if(is_main){
+    reply_fd = STDIN_FILENO;
+    cmd_fd = STDOUT_FILENO;
+  }
+  else{
+    ptoc_fd = 3;
+    ctop_fd = 4;
+    if(mkfifo(args[1], 0666) < 0){
+      perror(strerror(errno));
+      exit(1);
+    }
+    if(mkfifo(args[2], 0666) < 0){
+      perror(strerror(errno));
+      exit(1);
+    }
+    cmd_fd = open(args[1], O_RDONLY);
+    reply_fd = open(args[2], O_WRONLY);
+    if(cmd_fd < 0 || reply_fd < 0){
+      perror("Open fifo failed.");
+      exit(1);
+    }
+    if(unlink(args[1]) == -1) {
+      perror("unlink cmd_fifo error");
+      exit(1);
+    }
+    if(unlink(args[2]) == -1) {
+      perror("unlink reply_fifo error");
+      exit(1);
+    }
+  }
+  int flags = fcntl(reply_fd, F_GETFD);
+  flags |= FD_CLOEXEC;
+  fcntl(reply_fd, F_SETFD, flags);
+  flags = fcntl(cmd_fd, F_GETFD);
+  flags |= FD_CLOEXEC;
+  fcntl(cmd_fd, F_SETFD, flags);
+
+  struct pollfd jdg_cmd[2];
+  jdg_cmd[0].fd = cmd_fd;
+  jdg_cmd[0].events = 0 | POLLIN;
+  // jdg_cmd[1].fd = reply_fd;
+  // jdg_cmd[1].events = 0 | POLLOUT;
+  struct pollfd pipe_cmd[70];
+  nfds_t pipe_fds = 0;
+
   // end TODO
 
   while (1) {
-    char *command_buffer = NULL;
+    char command_buffer[buf_size] = "";
     Command command = {.buf = command_buffer, .len = 0, .type = UNKNOWN};
     // TODO: poll the STDIO/FIFO for commands.
+
+    int cmds = poll(jdg_cmd, 1, 0);
 
     // end TODO
 
     // TODO: poll parent, and child processes for custom commands.
+    
+    int pipe_cmds = poll(pipe_cmd, pipe_fds, 0);
 
     // end TODO
 
     // TODO: classify the command and execute it.
-    command_handler(&command);
+
+    if(cmds > 0){
+      char typ[10] = "";
+      char c;
+      int ptr = 0;
+      while((c = getc(jdg_cmd[0].fd)) != ' ' && c != '\n' && c != EOF){
+        typ[ptr++] = c;
+      }
+      typ[ptr] = '\0';
+      if(c != '\n' && c!=EOF){
+        fgets(command_buffer, buf_size, jdg_cmd[0].fd);
+        command.len = strlen(command_buffer);
+      }
+      if(strcmp(typ, "create") == 0){
+        command.type = CREATE;
+      }
+      else if(strcmp(typ, "store") == 0){
+        command.type = STORE;
+      }
+      else if(strcmp(typ, "delete") == 0){
+        command.type = DELETE;
+      }
+      else if(strcmp(typ, "fetch") == 0){
+        command.type = FETCH;
+      }
+      else if(strcmp(typ, "update") == 0){
+        command.type = UPDATE;
+      }
+      command_handler(&command);
+    }
+
     // end TODO
 
     // TODO: handle custom commands.
+
+    // if(pipe_cmds > 0){}
+    // command_handler(&command);
 
     // end TODO
   }
@@ -66,6 +170,57 @@ int command_handler(Command *cmd) {
 
 int create_handler(char *buf, size_t len) {
   // TODO: Implement the CREATE command handler.
+
+  struct Child *crt_chd = malloc(1*sizeof(struct Child));
+  int tmp_ptoc[2];
+  int tmp_ctop[2];
+  pipe(tmp_ptoc);
+  pipe(tmp_ctop);
+  pid_t pid = fork();
+  if(pid == 0){
+    if(tmp_ptoc[0] != 3){
+      dup2(tmp_ptoc[0], 3);
+      close(tmp_ptoc[0]);
+    }
+    close(tmp_ptoc[1]);
+    close(tmp_ctop[0]);
+    if(tmp_ctop[1] != 4){
+      dup2(tmp_ctop[1], 4);
+      close(tmp_ctop[1]);
+    }
+    char cmd_fifo[1024] = "";
+    char reply_fifo[1024] = "";
+    int ptr = 0;
+    while(buf[ptr] != ' '){
+      cmd_fifo[ptr] = buf[ptr];
+      ptr++;
+    }
+    cmd_fifo[ptr] = '\0';
+    int rep_ptr;
+    while(ptr<len){
+      reply_fifo[rep_ptr++] = buf[ptr++];
+    }
+    reply_fifo[rep_ptr] = '\0';
+    char *args[] = {"./sp", cmd_fifo, reply_fifo, NULL};
+    execv(args[0], args);
+    perror("exec failed.");
+    exit(1);
+  }
+  close(tmp_ptoc[0]);
+  close(tmp_ctop[1]);
+  crt_chd->ptoc = tmp_ptoc[1];
+  crt_chd->ctop = tmp_ctop[0];
+  crt_chd->pid = pid;
+  crt_chd->nxt = NULL;
+  if(child_head == NULL){
+    child_head = crt_chd;
+    child_tail = crt_chd;
+  }
+  else{
+    child_tail->nxt = crt_chd;
+    child_tail = crt_chd;
+  }
+  return 0;
 }
 
 int store_handler(char *buf, size_t len) {
