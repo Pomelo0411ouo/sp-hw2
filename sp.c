@@ -9,10 +9,11 @@
 #include <sys/stat.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
 
 typedef struct {
   pid_t pid;
-  struct child *nxt;
+  struct Child *nxt;
   int child_ptoc;
   int child_ctop;
 } Child;
@@ -20,9 +21,15 @@ typedef struct {
 char buf[1024];
 size_t buf_size = 1024;
 
-struct Child *child_head = NULL;
-struct Child *child_tail = NULL;
+Child *child_head = NULL;
+Child *child_tail = NULL;
 
+static void set_cloexec(int fd) {
+  int flags = fcntl(fd, F_GETFD);
+  if (flags != -1) {
+    fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+  }
+}
 
 int main(int argc, char *argv[]) {
   int cmd_fd, reply_fd, ptoc_fd, ctop_fd;
@@ -37,41 +44,42 @@ int main(int argc, char *argv[]) {
   //       variables here.
 
   if(is_main){
-    reply_fd = STDIN_FILENO;
-    cmd_fd = STDOUT_FILENO;
+    cmd_fd = STDIN_FILENO;
+    reply_fd = STDOUT_FILENO;
+    ptoc_fd = -1;
+    ctop_fd = -1;
   }
   else{
     ptoc_fd = 3;
     ctop_fd = 4;
-    if(mkfifo(args[1], 0666) < 0){
-      perror(strerror(errno));
+    if(mkfifo(argv[1], 0666) < 0){
+      perror("mkfifo failed.");
       exit(1);
     }
-    if(mkfifo(args[2], 0666) < 0){
-      perror(strerror(errno));
+    if(mkfifo(argv[2], 0666) < 0){
+      perror("mkfifo failed.");
       exit(1);
     }
-    cmd_fd = open(args[1], O_RDONLY);
-    reply_fd = open(args[2], O_WRONLY);
+    cmd_fd = open(argv[1], O_RDONLY);
+    reply_fd = open(argv[2], O_WRONLY);
     if(cmd_fd < 0 || reply_fd < 0){
       perror("Open fifo failed.");
       exit(1);
     }
-    if(unlink(args[1]) == -1) {
+    int flags = fcntl(reply_fd, F_GETFD);
+    set_cloexec(cmd_fd);
+    set_cloexec(reply_fd);
+    set_cloexec(ptoc_fd);
+    set_cloexec(ctop_fd);
+    if(unlink(argv[1]) == -1) {
       perror("unlink cmd_fifo error");
       exit(1);
     }
-    if(unlink(args[2]) == -1) {
+    if(unlink(argv[2]) == -1) {
       perror("unlink reply_fifo error");
       exit(1);
     }
   }
-  int flags = fcntl(reply_fd, F_GETFD);
-  flags |= FD_CLOEXEC;
-  fcntl(reply_fd, F_SETFD, flags);
-  flags = fcntl(cmd_fd, F_GETFD);
-  flags |= FD_CLOEXEC;
-  fcntl(cmd_fd, F_SETFD, flags);
 
   struct pollfd jdg_cmd[2];
   jdg_cmd[0].fd = cmd_fd;
@@ -84,7 +92,7 @@ int main(int argc, char *argv[]) {
   // end TODO
 
   while (1) {
-    char command_buffer[buf_size] = "";
+    char command_buffer[1024] = "";
     Command command = {.buf = command_buffer, .len = 0, .type = UNKNOWN};
     // TODO: poll the STDIO/FIFO for commands.
 
@@ -112,7 +120,10 @@ int main(int argc, char *argv[]) {
         fgets(command_buffer, buf_size, jdg_cmd[0].fd);
         command.len = strlen(command_buffer);
       }
-      if(strcmp(typ, "create") == 0){
+      if(c == EOF){
+        command.type = KILL;
+      }
+      else if(strcmp(typ, "create") == 0){
         command.type = CREATE;
       }
       else if(strcmp(typ, "store") == 0){
@@ -126,6 +137,9 @@ int main(int argc, char *argv[]) {
       }
       else if(strcmp(typ, "update") == 0){
         command.type = UPDATE;
+      }
+      else if(strcmp(typ, "kill") == 0){
+        command.type = KILL;
       }
       command_handler(&command);
     }
@@ -174,10 +188,20 @@ int create_handler(char *buf, size_t len) {
   struct Child *crt_chd = malloc(1*sizeof(struct Child));
   int tmp_ptoc[2];
   int tmp_ctop[2];
-  pipe(tmp_ptoc);
-  pipe(tmp_ctop);
+  if(pipe(tmp_ptoc) < 0 || pipe(tmp_ctop) < 0){
+    perror("pipe failed");
+    return -1;
+  }
   pid_t pid = fork();
+  if(pid < 0){
+    perror("fork failed");
+    return -1;
+  }
   if(pid == 0){
+    if(tmp_ctop[1] == 3){
+      tmp_ctop[1] = dup(tmp_ctop[1]);
+      close(3);
+    }
     if(tmp_ptoc[0] != 3){
       dup2(tmp_ptoc[0], 3);
       close(tmp_ptoc[0]);
@@ -195,12 +219,16 @@ int create_handler(char *buf, size_t len) {
       cmd_fifo[ptr] = buf[ptr];
       ptr++;
     }
-    cmd_fifo[ptr] = '\0';
-    int rep_ptr;
-    while(ptr<len){
+    cmd_fifo[ptr++] = '\0';
+    int rep_ptr = 0;
+    while(ptr<len && buf[ptr] != '\n'){
       reply_fifo[rep_ptr++] = buf[ptr++];
     }
     reply_fifo[rep_ptr] = '\0';
+    size_t r_len = strlen(reply_fifo);
+    if (r_len > 0 && reply_fifo[r_len - 1] == '\n') {
+      reply_fifo[r_len - 1] = '\0';
+    }
     char *args[] = {"./sp", cmd_fifo, reply_fifo, NULL};
     execv(args[0], args);
     perror("exec failed.");
@@ -208,6 +236,8 @@ int create_handler(char *buf, size_t len) {
   }
   close(tmp_ptoc[0]);
   close(tmp_ctop[1]);
+  set_cloexec(tmp_ptoc[1]);
+  set_cloexec(tmp_ctop[0]);
   crt_chd->ptoc = tmp_ptoc[1];
   crt_chd->ctop = tmp_ctop[0];
   crt_chd->pid = pid;
