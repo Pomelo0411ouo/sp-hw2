@@ -26,12 +26,18 @@ typedef struct Child {
   struct Child *nxt;
 } Child;
 
-typedef struct KV{
+typedef struct KV {
   char *key;
   char *val;
-  int val_len;
+  size_t val_len;
   struct KV *nxt;
 } KV;
+
+typedef struct Request {
+  char hash[20];
+  int target_fd;
+  struct Request *nxt;
+} Request;
 
 int cmd_fd = -1, reply_fd = -1, ptoc_fd = -1, ctop_fd = -1;
 bool is_main = false;
@@ -41,6 +47,8 @@ KV *local_table = NULL;
 Child *child_head = NULL;
 Child *child_tail = NULL;
 
+Request *req_head = NULL;
+
 LineBuf cmd_lb = {NULL, 0, 0};
 LineBuf ptoc_lb = {NULL, 0, 0};
 
@@ -49,6 +57,22 @@ static void set_cloexec(int fd){
   if(flags != -1){
     fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
   }
+}
+
+int write_all(int fd, char *buf, size_t len){
+size_t sent = 0;
+int n;
+  while(sent < len){
+    if((n = write(fd, buf + sent, len - sent)) < 0){
+      if(errno != EINTR && errno != EAGAIN){
+        perror("write failed.");
+        return -1;
+      }
+      continue;
+    }
+    sent += n;
+  }
+  return 0;
 }
 
 int lb_append(LineBuf *lb, const char *src, size_t n){
@@ -84,8 +108,82 @@ static void lb_consume(LineBuf *lb, size_t consumed){
   }
 }
 
-void handle_parent_msg(char *line, size_t len){};
-void handle_child_msg(Child *chd, char *line, size_t len){};
+void handle_parent_msg(char *line, size_t len){
+  char *space = memchr(line, ' ', len);
+  if(!space) exit(1);
+  *space = '\0';
+  char *hash = line;
+  size_t hash_len = strlen(line);
+  char *val = space + 1;
+  size_t val_len = len - hash_len - 1;
+  Request *cur = req_head;
+  Request *prev = NULL;
+  while(cur != NULL){
+    if(strcmp(cur->hash, hash) == 0){
+      write_all(cur->target_fd, hash, hash_len);
+      write_all(cur->target_fd, " ", 1);
+      write_all(cur->target_fd, val, val_len);
+      write_all(cur->target_fd, "\n", 1);
+      if(prev == NULL){
+        req_head = cur->nxt;
+        free(cur);
+      }
+      else{
+        prev->nxt = cur->nxt;
+        free(cur);
+      }
+      return;
+    }
+    prev = cur;
+    cur = cur->nxt;
+  }
+  perror("request missed.");
+  exit(1);
+}
+void handle_child_msg(Child *chd, char *line, size_t len){
+  char *space = memchr(line, ' ', len);
+  if(!space) exit(1);
+  *space = '\0';
+  char *hash = line;
+  size_t hash_len = strlen(line);
+  char *req_key = space + 1;
+  size_t key_len = len - hash_len - 1;
+  KV *cur = local_table;
+  while(cur != NULL){
+    if(strcmp(req_key, cur->key) == 0){
+      write_all(chd->child_ptoc, hash, hash_len);
+      write_all(chd->child_ptoc, " ", 1);
+      write_all(chd->child_ptoc, cur->val, cur->val_len);
+      write_all(chd->child_ptoc, "\n", 1);
+      return;
+    }
+    cur = cur->nxt;
+  }
+  if(!is_main){
+    Request *new_req = malloc(sizeof(Request));
+    strncpy(new_req->hash, hash, 18);
+    new_req->hash[18] = '\0';
+    new_req->target_fd = chd->child_ptoc;
+    new_req->nxt = NULL;
+    Request *cur = req_head;
+    Request *prev = NULL;
+    while(cur != NULL){
+      prev = cur;
+      cur = cur->nxt;
+    }
+    if(prev == NULL){
+      req_head = new_req;
+    }
+    else{
+      prev->nxt = new_req;
+    }
+    write_all(ctop_fd, hash, hash_len);
+    write_all(ctop_fd, " ", 1);
+    write_all(ctop_fd, req_key, key_len);
+    write_all(ctop_fd, "\n", 1);
+  }
+  return;
+}
 
 // Record: 11/11 rest: input and poll
 
@@ -467,10 +565,48 @@ int delete_handler(char *buf, size_t len) {
 int fetch_handler(char *buf, size_t len) {
   // TODO: Implement the FETCH command handler.
 
-  // char *space = memchr(buf, ' ', len);
-  // space = '\0';
-  // char *hash = buf;
-  // char *key = space+1;
+  char *space = memchr(buf, ' ', len);
+  if (!space) return -1;
+  *space = '\0';
+  char *hash = buf;
+  size_t hash_len = strlen(buf);
+  char *req_key = space+1;
+  size_t key_len = len - hash_len - 1;
+  KV *cur = local_table;
+  while(cur != NULL){
+    if(strcmp(req_key, cur->key) == 0){
+      write_all(reply_fd, hash, hash_len);
+      write_all(reply_fd, " ", 1);
+      write_all(reply_fd, cur->val, cur->val_len);
+      write_all(reply_fd, "\n", 1);
+      return 0;
+    }
+    cur = cur->nxt;
+  }
+  if(!is_main){
+    Request *new_req = malloc(sizeof(Request));
+    strncpy(new_req->hash, hash, 18);
+    new_req->hash[18] = '\0';
+    new_req->target_fd = reply_fd;
+    new_req->nxt = NULL;
+    Request *cur = req_head;
+    Request *prev = NULL;
+    while(cur != NULL){
+      prev = cur;
+      cur = cur->nxt;
+    }
+    if(prev == NULL){
+      req_head = new_req;
+    }
+    else{
+      prev->nxt = new_req;
+    }
+    write_all(ctop_fd, hash, hash_len);
+    write_all(ctop_fd, " ", 1);
+    write_all(ctop_fd, req_key, key_len);
+    write_all(ctop_fd, "\n", 1);
+  }
+  return 0;
 }
 
 int kill_handler(char *buf, size_t len) {
@@ -501,6 +637,13 @@ int kill_handler(char *buf, size_t len) {
     free(prev_kv->key);
     free(prev_kv->val);
     free(prev_kv);
+  }
+  Request *cur_r = req_head;
+  Request *prev_r = cur_r;
+  while (cur_r != NULL) {
+    prev_r = cur_r;
+    cur_r = cur_r->nxt;
+    free(prev_r);
   }
   exit(0);
 }
