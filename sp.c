@@ -10,30 +10,87 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <sys/wait.h>
 
 typedef struct {
+    char *buf;
+    size_t len;
+    size_t cap;
+} LineBuf;
+
+typedef struct Child {
   pid_t pid;
-  struct Child *nxt;
   int child_ptoc;
   int child_ctop;
+  LineBuf ctop_lb;
+  struct Child *nxt;
 } Child;
 
-char buf[1024];
-size_t buf_size = 1024;
+typedef struct KV{
+  char *key;
+  char *val;
+  int val_len;
+  struct KV *nxt;
+} KV;
+
+int cmd_fd = -1, reply_fd = -1, ptoc_fd = -1, ctop_fd = -1;
+bool is_main = false;
+
+KV *local_table = NULL;
 
 Child *child_head = NULL;
 Child *child_tail = NULL;
 
-static void set_cloexec(int fd) {
+LineBuf cmd_lb = {NULL, 0, 0};
+LineBuf ptoc_lb = {NULL, 0, 0};
+
+static void set_cloexec(int fd){
   int flags = fcntl(fd, F_GETFD);
-  if (flags != -1) {
+  if(flags != -1){
     fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
   }
 }
 
+int lb_append(LineBuf *lb, const char *src, size_t n){
+    if(lb->len + n + 1 > lb->cap){
+        size_t new_cap = (lb->cap == 0) ? 1024 : lb->cap;
+        while(new_cap < lb->len + n + 1){
+            new_cap *= 2;
+        }
+        char *new_buf = realloc(lb->buf, new_cap);
+        if(!new_buf) return -1;
+        lb->buf = new_buf;
+        lb->cap = new_cap;
+    }
+    memcpy(lb->buf + lb->len, src, n);
+    lb->len += n;
+    lb->buf[lb->len] = '\0';
+    return 0;
+}
+
+static void lb_consume(LineBuf *lb, size_t consumed){
+  size_t remain = lb->len - consumed;
+  if(remain > 0){
+    memmove(lb->buf, lb->buf + consumed, remain);
+  }
+  lb->len = remain;
+  if(lb->buf){
+    lb->buf[lb->len] = '\0';
+  }
+  if(lb->len == 0 && lb->cap > 4096){
+    free(lb->buf);
+    lb->buf = NULL;
+    lb->cap = 0;
+  }
+}
+
+void handle_parent_msg(char *line, size_t len);
+void handle_child_msg(Child *chd, char *line, size_t len);
+
+// Record: 11/11 rest: input and poll
+
 int main(int argc, char *argv[]) {
-  int cmd_fd, reply_fd, ptoc_fd, ctop_fd;
-  bool is_main = false;
+
   if (argc == 1) {
     is_main = true;
   }
@@ -66,91 +123,189 @@ int main(int argc, char *argv[]) {
       perror("Open fifo failed.");
       exit(1);
     }
-    int flags = fcntl(reply_fd, F_GETFD);
     set_cloexec(cmd_fd);
     set_cloexec(reply_fd);
     set_cloexec(ptoc_fd);
     set_cloexec(ctop_fd);
-    if(unlink(argv[1]) == -1) {
-      perror("unlink cmd_fifo error");
+    if(unlink(argv[1]) == -1){
+      perror("unlink cmd_fifo failed");
       exit(1);
     }
-    if(unlink(argv[2]) == -1) {
-      perror("unlink reply_fifo error");
+    if(unlink(argv[2]) == -1){
+      perror("unlink reply_fifo failed");
       exit(1);
     }
   }
 
-  struct pollfd jdg_cmd[2];
-  jdg_cmd[0].fd = cmd_fd;
-  jdg_cmd[0].events = 0 | POLLIN;
-  // jdg_cmd[1].fd = reply_fd;
-  // jdg_cmd[1].events = 0 | POLLOUT;
-  struct pollfd pipe_cmd[70];
-  nfds_t pipe_fds = 0;
-
   // end TODO
 
   while (1) {
-    char command_buffer[1024] = "";
-    Command command = {.buf = command_buffer, .len = 0, .type = UNKNOWN};
+    Command command = {.buf = "", .len = 0, .type = UNKNOWN};
+
+    struct pollfd fds[40];
+    Child *fd_map[40] = {NULL};
+    nfds_t nfds = 0;
+
     // TODO: poll the STDIO/FIFO for commands.
 
-    int cmds = poll(jdg_cmd, 1, 0);
+    fds[0].fd = cmd_fd;
+    fds[0].events = POLLIN;
+    fds[0].revents = 0;
+    nfds = 1;
 
     // end TODO
 
     // TODO: poll parent, and child processes for custom commands.
     
-    int pipe_cmds = poll(pipe_cmd, pipe_fds, 0);
+    fds[1].fd = ptoc_fd;
+    fds[1].events = POLLIN;
+    fds[1].revents = 0;
+    nfds = 2;
+
+    for(Child *cur = child_head; cur != NULL; cur = cur->nxt){
+      fds[nfds].fd = cur->child_ctop;
+      fds[nfds].events = POLLIN;
+      fds[nfds].revents = 0;
+      fd_map[nfds] = cur;
+      nfds++;
+    }
 
     // end TODO
 
+    int ready = poll(fds, nfds, -1);
+    if(ready < 0){
+      if(errno == EINTR) continue;
+      perror("poll error");
+      exit(1);
+    }
+
     // TODO: classify the command and execute it.
 
-    if(cmds > 0){
-      char typ[10] = "";
-      char c;
-      int ptr = 0;
-      while((c = getc(jdg_cmd[0].fd)) != ' ' && c != '\n' && c != EOF){
-        typ[ptr++] = c;
+    char read_chunk[65536];
+
+    if(fds[0].revents & (POLLIN | POLLHUP)){
+      ssize_t n = read(cmd_fd, read_chunk, sizeof(read_chunk));
+      if(n < 0){
+        if(errno != EINTR && errno != EAGAIN){
+          perror("read cmd_fd failed.");
+          exit(1);
+        }
       }
-      typ[ptr] = '\0';
-      if(c != '\n' && c!=EOF){
-        fgets(command_buffer, buf_size, jdg_cmd[0].fd);
-        command.len = strlen(command_buffer);
+      else if(n == 0){
+        Command kill_cmd = {.buf = "", .len = 0, .type = KILL};
+        command_handler(&kill_cmd);
       }
-      if(c == EOF){
-        command.type = KILL;
+      else{
+        if(lb_append(&cmd_lb, read_chunk, (size_t)n) < 0){
+          perror("realloc cmd failed.");
+          exit(1);
+        }
+
+        char *nl;
+        while((nl = memchr(cmd_lb.buf, '\n', cmd_lb.len)) != NULL){
+          size_t line_len = (size_t)(nl - cmd_lb.buf);
+          *nl = '\0';
+          char *space = memchr(cmd_lb.buf, ' ', line_len);
+          char *cmd_type_str = cmd_lb.buf;
+          char *arg_ptr = "";
+          size_t arg_len = 0;
+
+          if(space != NULL){
+            *space = '\0';
+            arg_ptr = space + 1;
+            arg_len = line_len - (size_t)(arg_ptr - cmd_lb.buf);
+          }
+
+          Command command = {.buf = arg_ptr, .len = arg_len, .type = UNKNOWN};
+          if(strcmp(cmd_type_str, "create") == 0) command.type = CREATE;
+          else if(strcmp(cmd_type_str, "store") == 0) command.type = STORE;
+          else if(strcmp(cmd_type_str, "delete") == 0) command.type = DELETE;
+          else if(strcmp(cmd_type_str, "fetch") == 0) command.type = FETCH;
+          else if(strcmp(cmd_type_str, "kill") == 0) command.type = KILL;
+          else if(strcmp(cmd_type_str, "update") == 0) command.type = UPDATE;
+
+          command_handler(&command);
+
+          lb_consume(&cmd_lb, line_len + 1);
+        }
       }
-      else if(strcmp(typ, "create") == 0){
-        command.type = CREATE;
-      }
-      else if(strcmp(typ, "store") == 0){
-        command.type = STORE;
-      }
-      else if(strcmp(typ, "delete") == 0){
-        command.type = DELETE;
-      }
-      else if(strcmp(typ, "fetch") == 0){
-        command.type = FETCH;
-      }
-      else if(strcmp(typ, "update") == 0){
-        command.type = UPDATE;
-      }
-      else if(strcmp(typ, "kill") == 0){
-        command.type = KILL;
-      }
-      command_handler(&command);
     }
 
     // end TODO
 
     // TODO: handle custom commands.
 
-    // if(pipe_cmds > 0){}
-    // command_handler(&command);
+    if(ptoc_fd != -1 && (fds[1].revents & (POLLIN | POLLHUP))){
+      ssize_t n = read(ptoc_fd, read_chunk, sizeof(read_chunk));
+      if(n < 0){
+        if(errno != EINTR && errno != EAGAIN){
+          perror("read ptoc_fd failed.");
+          exit(1);
+        }
+      }
+      else if(n == 0){
+        Command kill_cmd = {.buf = "", .len = 0, .type = KILL};
+        command_handler(&kill_cmd);
+      }
+      else if(n > 0){
+        if(lb_append(&ptoc_lb, read_chunk, (size_t)n) < 0){
+          perror("realloc ptoc_lb failed.");
+          exit(1);
+        }
+        char *nl;
+        while((nl = memchr(ptoc_lb.buf, '\n', ptoc_lb.len)) != NULL){
+          size_t line_len = (size_t)(nl - ptoc_lb.buf);
+          *nl = '\0';
+          handle_parent_msg(ptoc_lb.buf, line_len);
+          lb_consume(&ptoc_lb, line_len + 1);
+        }
+      }
+    }
 
+    for(nfds_t i = 2; i < nfds; i++){
+      if(!(fds[i].revents & (POLLIN | POLLHUP))) continue;
+
+      Child *chd = fd_map[i];
+      ssize_t n = read(chd->child_ctop, read_chunk, sizeof(read_chunk));
+      if(n < 0){
+        if(errno != EINTR && errno != EAGAIN){
+          perror("read ctop_fd failed.");
+          exit(1);
+        }
+      }
+      if(n == 0){
+        waitpid(chd->pid, NULL, 0);
+        close(chd->child_ptoc);
+        close(chd->child_ctop);
+        free(chd->ctop_lb.buf);
+
+        Child *prev = NULL, *cur = child_head;
+        while(cur != chd){
+          prev = cur;
+          cur = cur->nxt;
+        }
+        if(cur == chd){
+          if(prev == NULL) child_head = chd->nxt;
+          else prev->nxt = chd->nxt;
+          if(child_tail == chd) child_tail = prev;
+        }
+        free(chd);
+      }
+      else if(n > 0){
+        if(lb_append(&chd->ctop_lb, read_chunk, (size_t)n) < 0){
+          perror("realloc ctop_lb failed.");
+          exit(1);
+        }
+        char *nl;
+        while((nl = memchr(chd->ctop_lb.buf, '\n', chd->ctop_lb.len)) != NULL){
+          size_t line_len = (size_t)(nl - chd->ctop_lb.buf);
+          *nl = '\0';
+          handle_child_msg(chd, chd->ctop_lb.buf, line_len);
+          lb_consume(&chd->ctop_lb, line_len + 1);
+        }
+      }
+    }
+    
     // end TODO
   }
 }
@@ -185,7 +340,7 @@ int command_handler(Command *cmd) {
 int create_handler(char *buf, size_t len) {
   // TODO: Implement the CREATE command handler.
 
-  struct Child *crt_chd = malloc(1*sizeof(struct Child));
+  Child *crt_chd = calloc(1, sizeof(Child));
   int tmp_ptoc[2];
   int tmp_ctop[2];
   if(pipe(tmp_ptoc) < 0 || pipe(tmp_ctop) < 0){
@@ -198,6 +353,8 @@ int create_handler(char *buf, size_t len) {
     return -1;
   }
   if(pid == 0){
+    close(tmp_ptoc[1]);
+    close(tmp_ctop[0]);
     if(tmp_ctop[1] == 3){
       tmp_ctop[1] = dup(tmp_ctop[1]);
       close(3);
@@ -206,30 +363,13 @@ int create_handler(char *buf, size_t len) {
       dup2(tmp_ptoc[0], 3);
       close(tmp_ptoc[0]);
     }
-    close(tmp_ptoc[1]);
-    close(tmp_ctop[0]);
     if(tmp_ctop[1] != 4){
       dup2(tmp_ctop[1], 4);
       close(tmp_ctop[1]);
     }
-    char cmd_fifo[1024] = "";
-    char reply_fifo[1024] = "";
-    int ptr = 0;
-    while(buf[ptr] != ' '){
-      cmd_fifo[ptr] = buf[ptr];
-      ptr++;
-    }
-    cmd_fifo[ptr++] = '\0';
-    int rep_ptr = 0;
-    while(ptr<len && buf[ptr] != '\n'){
-      reply_fifo[rep_ptr++] = buf[ptr++];
-    }
-    reply_fifo[rep_ptr] = '\0';
-    size_t r_len = strlen(reply_fifo);
-    if (r_len > 0 && reply_fifo[r_len - 1] == '\n') {
-      reply_fifo[r_len - 1] = '\0';
-    }
-    char *args[] = {"./sp", cmd_fifo, reply_fifo, NULL};
+    char *space = memchr(buf, ' ', len);
+    *space = '\0';
+    char *args[] = {"./sp", buf, space+1, NULL};
     execv(args[0], args);
     perror("exec failed.");
     exit(1);
@@ -238,8 +378,8 @@ int create_handler(char *buf, size_t len) {
   close(tmp_ctop[1]);
   set_cloexec(tmp_ptoc[1]);
   set_cloexec(tmp_ctop[0]);
-  crt_chd->ptoc = tmp_ptoc[1];
-  crt_chd->ctop = tmp_ctop[0];
+  crt_chd->child_ptoc = tmp_ptoc[1];
+  crt_chd->child_ctop = tmp_ctop[0];
   crt_chd->pid = pid;
   crt_chd->nxt = NULL;
   if(child_head == NULL){
@@ -255,6 +395,41 @@ int create_handler(char *buf, size_t len) {
 
 int store_handler(char *buf, size_t len) {
   // TODO: Implement the STORE command handler.
+
+  char *space = memchr(buf, ' ', len);
+  *space = '\0';
+  char *k = buf;
+  int k_len = strlen(k);
+  char *v = space+1;
+  int new_vlen = strlen(v);
+  char *new_v;
+  KV *cur = local_table;
+  KV *last = cur;
+  while(cur != NULL){
+    if(strcmp(k, cur->key) == 0){
+      new_v = realloc(cur->val, (new_vlen+1) * sizeof(char));
+      memcpy(new_v, v, new_vlen);
+      new_v[new_vlen] = '\0';
+      cur->val = new_v;
+      cur->val_len = new_vlen;
+      break;
+    }
+    last = cur;
+    cur = cur->nxt;
+  }
+  if(cur == NULL){
+    KV *new_pair = malloc(sizeof(KV));
+    new_v = malloc((new_vlen + 1) * sizeof(char));
+    memcpy(new_v, v, new_vlen);
+    new_v[new_vlen] = '\0';
+    new_pair->val = new_v;
+    new_paie->val_len = new_vlen;
+    char *new_k = malloc(sizeof(char) * (k_len + 1));
+    memcpy(new_k, k, k_len);
+    new_k[k_len] = '\0';
+    new_pair->key = new_k;
+    new_pair->nxt = NULL;
+  }
 }
 
 int delete_handler(char *buf, size_t len) {
