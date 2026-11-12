@@ -396,17 +396,19 @@ int store_handler(char *buf, size_t len) {
   // TODO: Implement the STORE command handler.
 
   char *space = memchr(buf, ' ', len);
+  if(!space) return -1;
   *space = '\0';
   char *k = buf;
-  int k_len = strlen(k);
+  size_t k_len = (size_t)(space - buf);
   char *v = space+1;
-  int new_vlen = strlen(v);
+  size_t new_vlen = len - k_len - 1;
   char *new_v;
   KV *cur = local_table;
   KV *prev = cur;
   while(cur != NULL){
     if(strcmp(k, cur->key) == 0){
-      new_v = realloc(cur->val, (new_vlen+1) * sizeof(char));
+      free(cur->val);
+      new_v = malloc((new_vlen+1) * sizeof(char));
       memcpy(new_v, v, new_vlen);
       new_v[new_vlen] = '\0';
       cur->val = new_v;
@@ -422,7 +424,7 @@ int store_handler(char *buf, size_t len) {
     memcpy(new_v, v, new_vlen);
     new_v[new_vlen] = '\0';
     new_pair->val = new_v;
-    new_paie->val_len = new_vlen;
+    new_pair->val_len = new_vlen;
     char *new_k = malloc(sizeof(char) * (k_len + 1));
     memcpy(new_k, k, k_len);
     new_k[k_len] = '\0';
@@ -464,6 +466,11 @@ int delete_handler(char *buf, size_t len) {
 
 int fetch_handler(char *buf, size_t len) {
   // TODO: Implement the FETCH command handler.
+
+  // char *space = memchr(buf, ' ', len);
+  // space = '\0';
+  // char *hash = buf;
+  // char *key = space+1;
 }
 
 int kill_handler(char *buf, size_t len) {
@@ -474,18 +481,18 @@ int kill_handler(char *buf, size_t len) {
   while(cur_c != NULL){
     prev_c = cur_c;
     cur_c = cur_c->nxt;
-    free(prev_c->ctop_lb);
-    close(prev_c->child_ctop);
     close(prev_c->child_ptoc);
     waitpid(prev_c->pid, NULL, 0);
+    close(prev_c->child_ctop);
+    free(prev_c->ctop_lb.buf);
     free(prev_c);
   }
-  close(ptoc_fd);
-  close(ctop_fd);
-  close(cmd_fd);
-  close(reply_fd);
-  free(ptoc_lb);
-  free(cmd_lb);
+  if(ptoc_fd != -1) close(ptoc_fd);
+  if(ctop_fd != -1) close(ctop_fd);
+  if(cmd_fd != -1) close(cmd_fd);
+  if(reply_fd != -1) close(reply_fd);
+  free(ptoc_lb.buf);
+  free(cmd_lb.buf);
   KV *cur_kv = local_table;
   KV *prev_kv = cur_kv;
   while(cur_kv != NULL){
@@ -500,4 +507,6 @@ int kill_handler(char *buf, size_t len) {
 
 int update_handler(char *buf, size_t len) {
   // TODO: Implement the UPDATE command handler.
+
+  return 0;
 }
