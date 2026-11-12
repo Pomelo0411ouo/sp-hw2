@@ -11,6 +11,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/wait.h>
+#include <signal.h>
 
 typedef struct {
     char *buf;
@@ -41,6 +42,7 @@ typedef struct Request {
 
 int cmd_fd = -1, reply_fd = -1, ptoc_fd = -1, ctop_fd = -1;
 bool is_main = false;
+char cons_path[4096] = "";
 
 KV *local_table = NULL;
 
@@ -79,7 +81,12 @@ int lb_append(LineBuf *lb, const char *src, size_t n){
     if(lb->len + n + 1 > lb->cap){
         size_t new_cap = (lb->cap == 0) ? 1024 : lb->cap;
         while(new_cap < lb->len + n + 1){
+          if(new_cap <= 262144){
             new_cap *= 2;
+          }
+          else{
+            new_cap += 524288;
+          }
         }
         char *new_buf = realloc(lb->buf, new_cap);
         if(!new_buf) return -1;
@@ -105,6 +112,13 @@ static void lb_consume(LineBuf *lb, size_t consumed){
     free(lb->buf);
     lb->buf = NULL;
     lb->cap = 0;
+  }
+  else if(lb->cap > 65536 && lb->len < 4096){
+    char *shrunk = realloc(lb->buf, 4096);
+    if(shrunk){
+      lb->buf = shrunk;
+      lb->cap = 4096;
+    }
   }
 }
 
@@ -182,12 +196,98 @@ void handle_child_msg(Child *chd, char *line, size_t len){
     write_all(ctop_fd, req_key, key_len);
     write_all(ctop_fd, "\n", 1);
   }
+  else{
+    char *val;
+    while(1){
+      bool brk = false;
+      int mtoc[2];
+      int ctom[2];
+      if(pipe(mtoc) < 0 || pipe(ctom) < 0){
+        perror("pipe failed");
+        exit(1);
+      }
+      pid_t cons_pid = fork();
+      if(cons_pid < 0){
+        perror("fork failed");
+        exit(1);
+      }
+      if(cons_pid == 0){
+        close(mtoc[1]);
+        close(ctom[0]);
+        Child *cur = child_head;
+        while(cur != NULL){
+          close(cur->child_ctop);
+          close(cur->child_ptoc);
+          cur = cur->nxt;
+        }
+        dup2(mtoc[0], 0);
+        close(mtoc[0]);
+        dup2(ctom[1], 1);
+        close(ctom[1]);
+        char *args[] = {cons_path, NULL};
+        execv(args[0], args);
+        perror("exec consultant failed.");
+        exit(1);
+      }
+      close(mtoc[0]);
+      close(ctom[1]);
+      set_cloexec(mtoc[1]);
+      set_cloexec(ctom[0]);
+      write_all(mtoc[1], req_key, key_len);
+      write_all(mtoc[1], "\n", 1);
+      close(mtoc[1]);
+      LineBuf cons_lb = {NULL, 0, 0};
+      while(1){
+        char read_chunk[65536];
+        ssize_t n = read(ctom[0], read_chunk, sizeof(read_chunk));
+        if(n < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+        if(n <= 0){
+          close(ctom[0]);
+          waitpid(cons_pid, NULL, 0);
+          free(cons_lb.buf);
+          brk = false;
+          break;
+        }
+        else{
+          if(lb_append(&cons_lb, read_chunk, (size_t)n) < 0){
+            perror("realloc cmd failed.");
+            exit(1);
+          }
+          char *nl;
+          if((nl = memchr(cons_lb.buf, '\n', cons_lb.len)) != NULL){
+            size_t line_len = (size_t)(nl - cons_lb.buf);
+            *nl = '\0';
+            if(strncmp("Ok: ", cons_lb.buf, 4) != 0){
+              close(ctom[0]);
+              waitpid(cons_pid, NULL, 0);
+              free(cons_lb.buf);
+              brk = false;
+              break;
+            }
+            close(ctom[0]);
+            waitpid(cons_pid, NULL, 0);
+            write_all(chd->child_ptoc, hash, hash_len);
+            write_all(chd->child_ptoc, " ", 1);
+            write_all(chd->child_ptoc, cons_lb.buf + 4, line_len - 4);
+            write_all(chd->child_ptoc, "\n", 1);
+            free(cons_lb.buf);
+            brk = true;
+            break;
+          }
+        }
+      }
+      if(brk){
+        break;
+      }
+    }
+  }
   return;
 }
 
 // Record: 11/11 rest: input and poll
 
 int main(int argc, char *argv[]) {
+  signal(SIGPIPE, SIG_IGN);
 
   if (argc == 1) {
     is_main = true;
@@ -203,6 +303,10 @@ int main(int argc, char *argv[]) {
     reply_fd = STDOUT_FILENO;
     ptoc_fd = -1;
     ctop_fd = -1;
+    char *env_path = getenv("JUDGE_CONSULTANT");
+    if(env_path){
+      strncpy(cons_path, env_path, sizeof(cons_path) - 1);
+    }
   }
   else{
     ptoc_fd = 3;
@@ -300,7 +404,7 @@ int main(int argc, char *argv[]) {
         }
 
         char *nl;
-        while((nl = memchr(cmd_lb.buf, '\n', cmd_lb.len)) != NULL){
+        while(cmd_lb.len > 0 && (nl = memchr(cmd_lb.buf, '\n', cmd_lb.len)) != NULL){
           size_t line_len = (size_t)(nl - cmd_lb.buf);
           *nl = '\0';
           char *space = memchr(cmd_lb.buf, ' ', line_len);
@@ -351,7 +455,7 @@ int main(int argc, char *argv[]) {
           exit(1);
         }
         char *nl;
-        while((nl = memchr(ptoc_lb.buf, '\n', ptoc_lb.len)) != NULL){
+        while(ptoc_lb.len > 0 && (nl = memchr(ptoc_lb.buf, '\n', ptoc_lb.len)) != NULL){
           size_t line_len = (size_t)(nl - ptoc_lb.buf);
           *nl = '\0';
           handle_parent_msg(ptoc_lb.buf, line_len);
@@ -394,7 +498,7 @@ int main(int argc, char *argv[]) {
           exit(1);
         }
         char *nl;
-        while((nl = memchr(chd->ctop_lb.buf, '\n', chd->ctop_lb.len)) != NULL){
+        while(chd->ctop_lb.len > 0 && (nl = memchr(chd->ctop_lb.buf, '\n', chd->ctop_lb.len)) != NULL){
           size_t line_len = (size_t)(nl - chd->ctop_lb.buf);
           *nl = '\0';
           handle_child_msg(chd, chd->ctop_lb.buf, line_len);
@@ -606,6 +710,91 @@ int fetch_handler(char *buf, size_t len) {
     write_all(ctop_fd, req_key, key_len);
     write_all(ctop_fd, "\n", 1);
   }
+  else{
+    char *val;
+    while(1){
+      bool brk = false;
+      int mtoc[2];
+      int ctom[2];
+      if(pipe(mtoc) < 0 || pipe(ctom) < 0){
+        perror("pipe failed");
+        return -1;
+      }
+      pid_t cons_pid = fork();
+      if(cons_pid < 0){
+        perror("fork failed");
+        return -1;
+      }
+      if(cons_pid == 0){
+        close(mtoc[1]);
+        close(ctom[0]);
+        Child *cur = child_head;
+        while(cur != NULL){
+          close(cur->child_ctop);
+          close(cur->child_ptoc);
+          cur = cur->nxt;
+        }
+        dup2(mtoc[0], 0);
+        close(mtoc[0]);
+        dup2(ctom[1], 1);
+        close(ctom[1]);
+        char *args[] = {cons_path, NULL};
+        execv(args[0], args);
+        perror("exec consultant failed.");
+        exit(1);
+      }
+      close(mtoc[0]);
+      close(ctom[1]);
+      set_cloexec(mtoc[1]);
+      set_cloexec(ctom[0]);
+      write_all(mtoc[1], req_key, key_len);
+      write_all(mtoc[1], "\n", 1);
+      close(mtoc[1]);
+      LineBuf cons_lb = {NULL, 0, 0};
+      while(1){
+        char read_chunk[65536];
+        ssize_t n = read(ctom[0], read_chunk, sizeof(read_chunk));
+        if(n < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+        if(n <= 0){
+          close(ctom[0]);
+          waitpid(cons_pid, NULL, 0);
+          free(cons_lb.buf);
+          brk = false;
+          break;
+        }
+        else{
+          if(lb_append(&cons_lb, read_chunk, (size_t)n) < 0){
+            perror("realloc cmd failed.");
+            exit(1);
+          }
+          char *nl;
+          if((nl = memchr(cons_lb.buf, '\n', cons_lb.len)) != NULL){
+            size_t line_len = (size_t)(nl - cons_lb.buf);
+            *nl = '\0';
+            if(strncmp("Ok: ", cons_lb.buf, 4) != 0){
+              close(ctom[0]);
+              waitpid(cons_pid, NULL, 0);
+              free(cons_lb.buf);
+              brk = false;
+              break;
+            }
+            close(ctom[0]);
+            waitpid(cons_pid, NULL, 0);
+            write_all(reply_fd, hash, hash_len);
+            write_all(reply_fd, " ", 1);
+            write_all(reply_fd, cons_lb.buf + 4, line_len - 4);
+            write_all(reply_fd, "\n", 1);
+            free(cons_lb.buf);
+            brk = true;
+            break;
+          }
+        }
+      }
+      if(brk){
+        break;
+      }
+    }
+  }
   return 0;
 }
 
@@ -651,5 +840,11 @@ int kill_handler(char *buf, size_t len) {
 int update_handler(char *buf, size_t len) {
   // TODO: Implement the UPDATE command handler.
 
+  char *new_cons = buf;
+  struct stat st;
+  if(stat(buf, &st) == 0 && S_ISREG(st.st_mode) && access(buf, X_OK) == 0){
+    strncpy(cons_path, new_cons, sizeof(cons_path) - 1);
+    cons_path[sizeof(cons_path) - 1] = '\0';
+  }
   return 0;
 }
