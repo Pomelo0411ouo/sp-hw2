@@ -84,8 +84,8 @@ static void lb_consume(LineBuf *lb, size_t consumed){
   }
 }
 
-void handle_parent_msg(char *line, size_t len);
-void handle_child_msg(Child *chd, char *line, size_t len);
+void handle_parent_msg(char *line, size_t len){};
+void handle_child_msg(Child *chd, char *line, size_t len){};
 
 // Record: 11/11 rest: input and poll
 
@@ -278,7 +278,6 @@ int main(int argc, char *argv[]) {
         close(chd->child_ptoc);
         close(chd->child_ctop);
         free(chd->ctop_lb.buf);
-
         Child *prev = NULL, *cur = child_head;
         while(cur != chd){
           prev = cur;
@@ -404,7 +403,7 @@ int store_handler(char *buf, size_t len) {
   int new_vlen = strlen(v);
   char *new_v;
   KV *cur = local_table;
-  KV *last = cur;
+  KV *prev = cur;
   while(cur != NULL){
     if(strcmp(k, cur->key) == 0){
       new_v = realloc(cur->val, (new_vlen+1) * sizeof(char));
@@ -414,7 +413,7 @@ int store_handler(char *buf, size_t len) {
       cur->val_len = new_vlen;
       break;
     }
-    last = cur;
+    prev = cur;
     cur = cur->nxt;
   }
   if(cur == NULL){
@@ -429,11 +428,38 @@ int store_handler(char *buf, size_t len) {
     new_k[k_len] = '\0';
     new_pair->key = new_k;
     new_pair->nxt = NULL;
+    if(prev == NULL){
+      local_table = new_pair;
+    }
+    else{
+      prev->nxt = new_pair;
+    }
   }
+  return 0;
 }
 
 int delete_handler(char *buf, size_t len) {
   // TODO: Implement the DELETE command handler.
+
+  KV *cur = local_table;
+  KV *prev = cur;
+  while(cur != NULL){
+    if(strcmp(buf, cur->key) == 0) break;
+    prev = cur;
+    cur = cur->nxt;
+  }
+  if(cur != NULL){
+    if(prev == cur){
+      local_table = cur->nxt;
+    }
+    else{
+      prev->nxt = cur->nxt;
+    }
+    free(cur->key);
+    free(cur->val);
+    free(cur);
+  }
+  return 0;
 }
 
 int fetch_handler(char *buf, size_t len) {
@@ -442,6 +468,34 @@ int fetch_handler(char *buf, size_t len) {
 
 int kill_handler(char *buf, size_t len) {
   // TODO: Implement the KILL command handler.
+
+  Child *cur_c = child_head;
+  Child *prev_c = cur_c;
+  while(cur_c != NULL){
+    prev_c = cur_c;
+    cur_c = cur_c->nxt;
+    free(prev_c->ctop_lb);
+    close(prev_c->child_ctop);
+    close(prev_c->child_ptoc);
+    waitpid(prev_c->pid, NULL, 0);
+    free(prev_c);
+  }
+  close(ptoc_fd);
+  close(ctop_fd);
+  close(cmd_fd);
+  close(reply_fd);
+  free(ptoc_lb);
+  free(cmd_lb);
+  KV *cur_kv = local_table;
+  KV *prev_kv = cur_kv;
+  while(cur_kv != NULL){
+    prev_kv = cur_kv;
+    cur_kv = cur_kv->nxt;
+    free(prev_kv->key);
+    free(prev_kv->val);
+    free(prev_kv);
+  }
+  exit(0);
 }
 
 int update_handler(char *buf, size_t len) {
